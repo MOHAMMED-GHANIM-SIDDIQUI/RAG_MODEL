@@ -43,8 +43,19 @@ RAG_MODEL/
 |-- requirements.txt
 |-- README.md
 |-- .gitignore
-|-- CONSTITUTION.pdf
-`-- RAG_CONSTITUTION.ipynb
+|-- data/
+|   `-- CONSTITUTION.pdf
+|-- notebooks/
+|   `-- RAG_CONSTITUTION.ipynb
+|-- src/
+|   `-- constitution_rag/
+|       |-- app.py
+|       |-- audio.py
+|       |-- indexing.py
+|       |-- rag_chain.py
+|       `-- settings.py
+`-- tests/
+    `-- test_settings.py
 ```
 
 ## Quick Start
@@ -104,10 +115,14 @@ source .venv/bin/activate
 ## Development Workflow
 
 ```bash
-python -m compileall main.py build_index.py
+set PYTHONPATH=src
+python -m compileall main.py build_index.py src
+pytest -q
 python build_index.py
 streamlit run main.py
 ```
+
+On macOS/Linux, use `export PYTHONPATH=src`.
 
 ## Roadmap
 
