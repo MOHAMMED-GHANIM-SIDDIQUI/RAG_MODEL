@@ -1,151 +1,189 @@
-import streamlit as st
-from langchain.vectorstores import FAISS
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain.chains import RetrievalQA
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_groq import ChatGroq
-from dotenv import load_dotenv
-from langchain.memory import ConversationBufferMemory
 from datetime import datetime
-from gtts import gTTS
+from pathlib import Path
 import io
 import os
 
-# Streamlit app
-def main():
-    # Initialize embedding and language model
-    EMBEDDING = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+from dotenv import load_dotenv
+from gtts import gTTS
+from langchain.chains import RetrievalQA
+from langchain_community.vectorstores import FAISS
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_groq import ChatGroq
+from langchain_huggingface import HuggingFaceEmbeddings
+import streamlit as st
 
-    llm = ChatGroq(
-        groq_api_key=st.secrets["GROQ_API_KEY"],
-        model_name="mixtral-8x7b-32768"
+
+APP_DIR = Path(__file__).resolve().parent
+INDEX_DIR = APP_DIR / "faiss-index"
+EMBEDDING_MODEL = "all-MiniLM-L6-v2"
+DEFAULT_GROQ_MODEL = "mixtral-8x7b-32768"
+
+
+def get_setting(name: str, default: str | None = None) -> str | None:
+    if name in st.secrets:
+        return st.secrets[name]
+    return os.getenv(name, default)
+
+
+def is_enabled(name: str, default: bool = False) -> bool:
+    value = get_setting(name, str(default)).lower()
+    return value in {"1", "true", "yes", "on"}
+
+
+@st.cache_resource(show_spinner=False)
+def load_embeddings():
+    return HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL)
+
+
+@st.cache_resource(show_spinner=False)
+def load_llm():
+    api_key = get_setting("GROQ_API_KEY")
+    if not api_key:
+        raise RuntimeError("GROQ_API_KEY is not configured.")
+    model_name = get_setting("RAG_GROQ_MODEL", DEFAULT_GROQ_MODEL)
+    return ChatGroq(groq_api_key=api_key, model_name=model_name)
+
+
+@st.cache_resource(show_spinner=False)
+def load_vector_store():
+    if not INDEX_DIR.exists():
+        raise FileNotFoundError("FAISS index not found. Run `python build_index.py` first.")
+    if not is_enabled("FAISS_INDEX_TRUSTED"):
+        raise PermissionError(
+            "FAISS index loading is disabled until FAISS_INDEX_TRUSTED=true is set. "
+            "Only enable it for an index you generated locally from trusted documents."
+        )
+    return FAISS.load_local(
+        str(INDEX_DIR),
+        embeddings=load_embeddings(),
+        allow_dangerous_deserialization=True,
     )
 
-    # Load the FAISS vector embeddings
-    vectors = FAISS.load_local(
-        "faiss-index", 
-        embeddings=EMBEDDING, 
-        allow_dangerous_deserialization=True
-    )
 
-    # Set up prompt template and QA chain
+def build_qa_chain():
     prompt = ChatPromptTemplate.from_template(
         """
-        You have expertise in the Indian Constitution and the laws, You have to answer some related questions!
-        Keep the responses Concise (of a maximum of 2 to 5 lines generally) unless asked to elongate the result.
-        Try to respond with the latest information available. First, try to make a 
-        sensible response from the data provided through the vector database of India's constitution.
-        If you don't know the answer, respond accordingly. Remember that the latest amendment done in the constitution was 106th in 2023, and 
-        India has 448 articles, 25 parts, and 12 schedules yet in the Constitution.
-        Keep the responses relevant to the Constitution of India pdf only by searching for the latest information in the database!
+        You are answering questions using retrieved context from the Constitution of India PDF.
+        Keep answers concise unless the user asks for detail.
+        If the answer is not supported by the retrieved context, say that the PDF context does not contain enough information.
+        Do not invent legal advice or current-law claims beyond the retrieved source.
+
+        Context:
         {context}
+
         Question: {question}
         """
     )
-
-    # Set up conversation memory
-    if "chat_memory" not in st.session_state:
-        st.session_state["chat_memory"] = {
-            "messages": []
-        }
-    if "last_response" not in st.session_state:
-        st.session_state["last_response"] = None  # To store the last response
-
-    memory = st.session_state["chat_memory"]
-
-    # Create a retrieval-based QA chain
-    qa_chain = RetrievalQA.from_chain_type(
-        llm,
-        retriever=vectors.as_retriever(),
+    vector_store = load_vector_store()
+    return RetrievalQA.from_chain_type(
+        llm=load_llm(),
+        retriever=vector_store.as_retriever(search_kwargs={"k": 4}),
         chain_type_kwargs={"prompt": prompt},
-        output_key="result"
+        return_source_documents=True,
+        output_key="result",
     )
 
-    # Sidebar for navigation
-    page = st.sidebar.radio("Select a Page", ["Main Chatbot", "Chat History"])
+
+def text_to_audio(response: str) -> io.BytesIO:
+    audio_bytes = io.BytesIO()
+    tts = gTTS(text=response, lang="en")
+    tts.write_to_fp(audio_bytes)
+    audio_bytes.seek(0)
+    return audio_bytes
+
+
+def init_state() -> None:
+    st.session_state.setdefault("messages", [])
+    st.session_state.setdefault("last_response", None)
+    st.session_state.setdefault("audio_bytes", None)
+
+
+def render_chat() -> None:
+    st.title("Indian Constitution RAG Chatbot")
+    st.caption("Ask questions against a local vector index built from the Constitution PDF.")
+
+    try:
+        qa_chain = build_qa_chain()
+    except Exception as exc:
+        st.error(str(exc))
+        st.info("Check README setup steps, rebuild the index, and configure required secrets.")
+        return
+
+    with st.form(key="qa_form"):
+        query = st.text_input("Enter your question")
+        submit_button = st.form_submit_button("Submit")
+
+    if st.session_state["last_response"] and not submit_button:
+        st.write("### Answer")
+        st.write(st.session_state["last_response"])
+        if st.session_state.get("audio_bytes"):
+            st.audio(st.session_state["audio_bytes"], format="audio/mp3")
+
+    if submit_button and query.strip():
+        with st.spinner("Retrieving context and generating answer..."):
+            result = qa_chain.invoke({"query": query.strip()})
+            response = result["result"]
+            st.session_state["last_response"] = response
+            st.session_state["messages"].append(
+                {"type": "human", "content": query.strip(), "timestamp": datetime.now()}
+            )
+            st.session_state["messages"].append(
+                {
+                    "type": "ai",
+                    "content": response,
+                    "timestamp": datetime.now(),
+                    "sources": [doc.metadata for doc in result.get("source_documents", [])],
+                }
+            )
+
+        st.write("### Answer")
+        st.write(response)
+
+        source_docs = result.get("source_documents", [])
+        if source_docs:
+            with st.expander("Retrieved source snippets"):
+                for idx, doc in enumerate(source_docs, start=1):
+                    st.markdown(f"**Source {idx}**")
+                    st.write(doc.page_content[:800])
+                    if doc.metadata:
+                        st.caption(str(doc.metadata))
+
+        if is_enabled("ENABLE_AUDIO", True):
+            with st.spinner("Converting response to audio..."):
+                try:
+                    st.session_state["audio_bytes"] = text_to_audio(response)
+                    st.audio(st.session_state["audio_bytes"], format="audio/mp3")
+                except Exception as exc:
+                    st.warning(f"Audio generation failed: {exc}")
+
+
+def render_history() -> None:
+    st.title("Chat History")
+    messages = st.session_state.get("messages", [])
+    if not messages:
+        st.info("No chat history yet.")
+        return
+
+    for message in reversed(messages):
+        timestamp = message["timestamp"].strftime("%H:%M:%S")
+        st.write(f"**{message['type'].upper()} ({timestamp})**")
+        st.write(message["content"])
+        st.markdown("---")
+
+
+def main() -> None:
+    load_dotenv()
+    st.set_page_config(page_title="Indian Constitution RAG", layout="wide")
+    init_state()
+
+    page = st.sidebar.radio("Select a page", ["Main Chatbot", "Chat History"])
+    st.sidebar.caption("Set GROQ_API_KEY and FAISS_INDEX_TRUSTED=true before running.")
 
     if page == "Main Chatbot":
-        st.title("📜 Indian Constitution Chatbot")
-        st.write("Ask any question about the Indian Constitution!")
+        render_chat()
+    else:
+        render_history()
 
-        # Use a form to wrap the input and submit button together
-        with st.form(key="qa_form"):
-            query = st.text_input("Enter your prompt:")
-            submit_button = st.form_submit_button("Submit")
-
-        # Display the latest response if it exists
-        if st.session_state.get("last_response") and not submit_button:
-            st.write("### Answer:")
-            st.write(st.session_state["last_response"])
-
-            # Display the latest audio if it exists
-            if st.session_state.get("audio_bytes"):
-                st.markdown("#### Your audio response:")
-                st.audio(st.session_state["audio_bytes"], format="audio/mp3", start_time=0)
-
-        # When submit button is pressed, process the query
-        if submit_button and query:
-            with st.spinner("Processing your query..."):
-                # Call the QA chain with the query
-                result = qa_chain({"query": query})
-                response = result['result']
-
-                # Store the query and response in memory with timestamps
-                memory["messages"].append({"type": "human", "content": query, "timestamp": datetime.now()})
-                memory["messages"].append({"type": "ai", "content": response, "timestamp": datetime.now()})
-
-                # Store the response in session_state for persistence
-                st.session_state["last_response"] = response
-
-                # Display the answer
-                st.write("### Answer:")
-                st.write(response)
-
-            with st.spinner("Converting the response to audio..."):
-                # Convert response to speech
-                try:
-                    tts = gTTS(text=response, lang='en')
-                    # Save to a BytesIO object
-                    audio_bytes = io.BytesIO()
-                    tts.write_to_fp(audio_bytes)  # Correct method to write directly to BytesIO
-                    audio_bytes.seek(0)  # Move to the beginning of the BytesIO object
-
-                    # Store audio bytes in session_state
-                    st.session_state["audio_bytes"] = audio_bytes
-
-                    # Display audio in Streamlit
-                    st.markdown("#### Your audio response:")
-                    st.audio(audio_bytes, format="audio/mp3", start_time=0)
-                except Exception as e:
-                    st.error(f"Failed to generate audio: {e}")
-
-
-    elif page == "Chat History":
-        st.title("📜 Chat History")
-
-        # Group messages into prompt-response pairs for better readability
-        grouped_messages = []
-        temp_pair = {}
-    
-        for message in memory["messages"]:
-            if message["type"] == "human":
-                # Start a new pair
-                temp_pair = {"prompt": message}
-            elif message["type"] == "ai" and temp_pair:
-                # Complete the pair
-                temp_pair["response"] = message
-                grouped_messages.append(temp_pair)
-                temp_pair = {}
-    
-        # Display chat history
-        for pair in grouped_messages[::-1]:  # Reverse to display latest first
-            prompt_time = pair["prompt"]["timestamp"].strftime("%H:%M:%S")
-            response_time = pair["response"]["timestamp"].strftime("%H:%M:%S")
-            st.write(f"**PROMPT ({prompt_time}):** {pair['prompt']['content']}")
-            st.write(f"**RESPONSE ({response_time}):** {pair['response']['content']}")
-            st.markdown("---")        
-            st.markdown("  \n")
 
 if __name__ == "__main__":
-    load_dotenv()
     main()
